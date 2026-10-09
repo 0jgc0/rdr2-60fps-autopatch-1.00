@@ -1,8 +1,17 @@
-﻿/* autopatch60-oneshot.c -- one-shot variant of the resident daemon.
+/* autopatch60-oneshot.c -- RDR2 (CUSA03041) v1.00 variant.
  * Waits for the RDR2 eboot (max. 10 min), verifies, writes, re-verifies,
- * notifies and EXITS. No residency: after notifying, neither process
- * nor traffic remains. Same safety: it never writes without verifying
- * (64-byte context + original bytes). */
+ * notifies and EXITS. No residency.
+ *
+ * v1.00 changes vs the 1.32 build:
+ *  - Target is eboot+0x04a8ee1f (RVA 0x468EE1F) instead of 0x05853029.
+ *  - The 1.32 64-byte context is gone (it does not match 1.00). Instead:
+ *      * relaxed check: target must be `cmove r32,r32` (0f 44 /r, mod==3);
+ *        the matching `xor r,r; nop` patch is derived from the register used.
+ *      * the 64-byte window around the target is always logged in hex to
+ *        LOG_PATH so you can paste it back and enable CTX_STRICT below.
+ *  - Set CTX_STRICT to 1 and fill CTX100[] to restore the original strict
+ *    64-byte verification once you have the real 1.00 bytes.
+ */
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <stdint.h>
@@ -21,19 +30,17 @@
 #define CMD_CONSOLE_NOTIFY 0xBDDD0004u
 #define CMD_FG_APP         0xBDDD0006u
 
-#define JAO_RVA   0x5453029u            /* 0x05853029 - 0x400000 */
+#define TARGET_RVA 0x468EE1Fu          /* 0x04a8ee1f - 0x400000 (v1.00; confirmed from log: cmove esi,eax sits 2 bytes after the reddit address) */
 #define PROT_EXEC 0x4u
 #define IMG_BASE_DEFAULT 0x400000u     /* base seen 100% of the time; fast-path only */
 
-/* 64-byte context of the clean 1.32 eboot around the target (target at +32).
- * Verified against the mounted patch0 copy and against live disassembly. */
-static const uint8_t JAO_CTX[64] = {
-    0x89,0x04,0xe9,0x49,0xff,0xc5,0x4d,0x39,0xf5,0x0f,0x82,0xe8,0xfd,0xff,0xff,0x8b,
-    0x05,0xb2,0xcf,0xd5,0x03,0x8b,0x3d,0xcc,0xd9,0xd6,0x03,0x8d,0x70,0xff,0x85,0xc0,
-    0x0f,0x44,0xf0,0xe8,0x2f,0xad,0x70,0x01,0x85,0xc0,0x0f,0x88,0xac,0x10,0x00,0x00,
-    0x44,0x8b,0x05,0x68,0xcf,0xd5,0x03,0x44,0x8b,0x0d,0x65,0xcf,0xd5,0x03,0x48,0x8d
-};
-#define JAO_CTX_OFF 32
+#define CTX_OFF 32                     /* target sits at +32 in the 64-byte window */
+
+/* Strict mode: paste the 64 bytes logged as "CTX64 ..." here, set CTX_STRICT 1. */
+#define CTX_STRICT 0
+#if CTX_STRICT
+static const uint8_t CTX100[64] = {0};
+#endif
 
 /* USB telemetry (read back later over FTP). Nothing sensitive. */
 #define LOG_PATH "/mnt/usb0/autopatch60.log"
@@ -47,8 +54,45 @@ static void tlog(const char *msg) {
     fclose(f);
 }
 
-static const uint8_t JAO_ORIG[3] = {0x0f, 0x44, 0xf0}; /* cmove esi,eax */
-static const uint8_t JAO_NEW[3]  = {0x31, 0xf6, 0x90}; /* xor esi,esi;nop */
+static void log_hex(const char *tag, const uint8_t *p, size_t n) {
+    char lb[300];
+    size_t i, o;
+    o = (size_t)snprintf(lb, sizeof(lb), "%s", tag);
+    for (i = 0; i < n && o + 4 < sizeof(lb); i++)
+        o += (size_t)snprintf(lb + o, sizeof(lb) - o, " %02x", p[i]);
+    tlog(lb);
+}
+
+/* cmove r32,r32 = 0f 44 /r with mod==3  ->  xor r32,r32 ; nop = 31 /r 90
+ * (31 c0|reg<<3|reg). Returns 0 and fills neu[3] if cur[] is patchable. */
+static int build_patch(const uint8_t *cur, uint8_t *neu) {
+    uint8_t reg;
+    if (cur[0] != 0x0f || cur[1] != 0x44)
+        return -1;
+    if ((cur[2] & 0xc0) != 0xc0)
+        return -1;
+    reg = (uint8_t)((cur[2] >> 3) & 7);
+    neu[0] = 0x31;
+    neu[1] = (uint8_t)(0xc0 | (reg << 3) | reg);
+    neu[2] = 0x90;
+    return 0;
+}
+
+/* already patched: 31 /r 90 with mod==3 and reg==rm */
+static int is_patched(const uint8_t *cur) {
+    return cur[0] == 0x31 && cur[2] == 0x90 &&
+           (cur[1] & 0xc0) == 0xc0 &&
+           ((cur[1] >> 3) & 7) == (cur[1] & 7);
+}
+
+static int ctx_ok(const uint8_t *ctx) {
+#if CTX_STRICT
+    return !memcmp(ctx, CTX100, 64);
+#else
+    uint8_t tmp[3];
+    return build_patch(ctx + CTX_OFF, tmp) == 0 || is_patched(ctx + CTX_OFF);
+#endif
+}
 
 static const char WANT_TITLEID[] = "CUSA03041";
 
@@ -243,30 +287,25 @@ static int eboot_base(uint32_t pid, uint64_t *base) {
     return 0;
 }
 
-/* one-shot flow: fast-path 64-byte context check, MAPS fallback on mismatch.
- * Fast-path reads 64 B at fast_base+RVA-32; an exact JAO_CTX match makes the
- * target safe without downloading MAPS (spawn->write ~1 s). Poll every 0.5 s. */
-#define AGGRESSIVE_CYCLES 360
+/* one-shot flow: fast-path context check, MAPS fallback on mismatch.
+ * Fast-path reads 64 B at fast_base+RVA-32; a match makes the target safe
+ * without downloading MAPS (spawn->write ~1 s). Poll every 0.5 s. */
 #define POLL_FAST_USEC 500000u
-#define POLL_SPARSE_SEC 15u
-#define MAX_NOTIFIES_PER_PID 3u
-#define AUTOPATCH_VERSION "oneshot-1.1"
+#define AUTOPATCH_VERSION "oneshot-1.1-v100"
 
 int main(void) {
-    /* Wait (max. 10 min) for RDR2 to boot, patch once verified and EXIT.
-     * No residency: after notifying, no process or traffic remains.
-     * If the game never shows up, exit quietly. */
     uint32_t pid = 0;
     char titleid[16] = {0};
     uint64_t base = 0, target = 0;
-    uint8_t ctx[64], cur[3];
+    uint8_t ctx[64], cur[3], neu[3];
     int have_target = 0;
     unsigned waited = 0;
     char lb[128];
     const unsigned LIMIT = 1200; /* 1200 x 0.5 s = 10 min */
 
-    printf("autopatch60 v%s (one-shot): waiting for game...\n", AUTOPATCH_VERSION);
-    tlog("BOOT oneshot");
+    printf("autopatch60 v%s (one-shot, RDR2 1.00): waiting for game...\n",
+           AUTOPATCH_VERSION);
+    tlog("BOOT oneshot v100");
     if (g_sock < 0 && connect_dbg()) {
         tlog("CONN_FAIL0");
         return 2;
@@ -286,19 +325,23 @@ int main(void) {
     }
     snprintf(lb, sizeof(lb), "SPAWN pid=%u", pid);
     tlog(lb);
-    /* 2) resolve target: CTX fast-path, MAPS fallback */
-    target = IMG_BASE_DEFAULT + JAO_RVA;
-    if (!proc_read(pid, target - JAO_CTX_OFF, ctx, 64) &&
-        !memcmp(ctx, JAO_CTX, 64)) {
-        have_target = 1;
-    } else if (!eboot_base(pid, &base)) {
-        target = base + JAO_RVA;
+
+    /* 2) resolve target: fast-path at default base, MAPS fallback */
+    target = IMG_BASE_DEFAULT + TARGET_RVA;
+    if (!proc_read(pid, target - CTX_OFF, ctx, 64)) {
+        log_hex("CTX64(fast)", ctx, 64);
+        if (ctx_ok(ctx))
+            have_target = 1;
+    }
+    if (!have_target && !eboot_base(pid, &base)) {
+        target = base + TARGET_RVA;
         snprintf(lb, sizeof(lb), "BASE 0x%llx pid=%u",
                  (unsigned long long)base, pid);
         tlog(lb);
-        if (!proc_read(pid, target - JAO_CTX_OFF, ctx, 64) &&
-            !memcmp(ctx, JAO_CTX, 64)) {
-            have_target = 1;
+        if (!proc_read(pid, target - CTX_OFF, ctx, 64)) {
+            log_hex("CTX64(maps)", ctx, 64);
+            if (ctx_ok(ctx))
+                have_target = 1;
         }
     }
     if (!have_target) {
@@ -306,24 +349,27 @@ int main(void) {
         notify("RDR2 60fps: target not found, not applied");
         return 3;
     }
+
     /* 3) verify -> write -> re-verify -> notify -> exit */
-    memcpy(cur, ctx + JAO_CTX_OFF, 3);
-    if (!memcmp(cur, JAO_NEW, 3)) {
+    memcpy(cur, ctx + CTX_OFF, 3);
+    if (is_patched(cur)) {
         tlog("ALREADY");
         notify("RDR2 60fps ON - made by KurohaXR");
         return 0;
     }
-    if (memcmp(cur, JAO_ORIG, 3) != 0) {
+    if (build_patch(cur, neu) != 0) {
         snprintf(lb, sizeof(lb), "ABORT_UNEXP %02x%02x%02x pid=%u",
                  cur[0], cur[1], cur[2], pid);
         tlog(lb);
         notify("RDR2 60fps: unexpected eboot, not applied");
         return 4;
     }
-    tlog("WRITE_TRY");
-    if (proc_write(pid, target, JAO_NEW, 3) ||
+    snprintf(lb, sizeof(lb), "WRITE_TRY %02x%02x%02x -> %02x%02x%02x",
+             cur[0], cur[1], cur[2], neu[0], neu[1], neu[2]);
+    tlog(lb);
+    if (proc_write(pid, target, neu, 3) ||
         proc_read(pid, target, cur, 3) ||
-        memcmp(cur, JAO_NEW, 3) != 0) {
+        memcmp(cur, neu, 3) != 0) {
         tlog("WRITE_FAIL");
         notify("RDR2 60fps: write failed, not applied");
         return 5;
